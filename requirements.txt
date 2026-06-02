@@ -1,0 +1,6 @@
+aiogram
+Pillow
+requests
+python-dotenv
+vkbottle>=4.3,<5
+aiohttp
