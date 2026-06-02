@@ -148,35 +148,118 @@ async def download_vk_photo(photo_attachment, user_id: int) -> Optional[str]:
         return None
 
 
+async def send_image_as_photo(
+    user_id: int, file_path: str, caption: str = ""
+) -> Optional[str]:
+    """
+    Отправить изображение как фото через photos.getMessagesUploadServer.
+    Это надёжнее чем docs-загрузка — VK не сжимает фото при отправке через API.
+    Возвращает строку attachment вида 'photo{owner_id}_{photo_id}'.
+    """
+    try:
+        api = bot.api
+
+        # 1. Получаем сервер для загрузки фото
+        upload_info = await api.photos.get_messages_upload_server(
+            peer_id=user_id
+        )
+        upload_url = upload_info.upload_url
+
+        # 2. Загружаем файл на сервер
+        async with aiohttp.ClientSession() as session:
+            with open(file_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field(
+                    "photo", f,
+                    filename=os.path.basename(file_path),
+                    content_type="image/jpeg"
+                )
+                async with session.post(upload_url, data=form) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(
+                            f"Ошибка загрузки фото: HTTP {resp.status}, body={body[:300]}"
+                        )
+                        return None
+                    upload_result = await resp.json()
+
+        # 3. Проверяем ответ
+        if "photo" not in upload_result or "server" not in upload_result:
+            logger.error(f"Неожиданный ответ от upload сервера: {upload_result}")
+            return None
+
+        # 4. Сохраняем фото
+        saved = await api.photos.save_messages_photo(
+            photo=upload_result["photo"],
+            server=str(upload_result["server"]),
+            hash=upload_result.get("hash", "")
+        )
+
+        if saved:
+            photo_obj = saved[0]
+            attachment = f"photo{photo_obj.owner_id}_{photo_obj.id}"
+
+            # 5. Отправляем сообщение с вложением
+            await api.messages.send(
+                user_id=user_id,
+                message=caption or "Готово!",
+                attachment=attachment,
+                random_id=0
+            )
+            return attachment
+
+        logger.error("photos.save_messages_photo вернул пустой результат")
+        return None
+
+    except Exception as e:
+        logger.error(f"Ошибка отправки фото: {e}")
+        return None
+
+
 async def send_image_as_document(
     user_id: int, file_path: str, caption: str = ""
 ) -> Optional[int]:
     """
-    Отправить изображение как документ (если оно слишком большое для фото).
-    Использует docs.getMessagesUploadServer.
+    Отправить изображение как документ (без сжатия).
+    Использует docs.getMessagesUploadServer + docs.save.
+    Fallback на send_image_as_photo при ошибке.
     """
     try:
         api = bot.api
-        # Загружаем документ
+
+        # 1. Получаем сервер для загрузки документа
         upload_info = await api.docs.get_messages_upload_server(
             peer_id=user_id, type="doc"
         )
-
         upload_url = upload_info.upload_url
 
-        # Формируем multipart-запрос
+        # 2. Загружаем файл
         async with aiohttp.ClientSession() as session:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
-                form.add_field("file", f, filename=os.path.basename(file_path))
+                form.add_field(
+                    "file", f,
+                    filename=os.path.basename(file_path),
+                    content_type="image/jpeg"
+                )
                 async with session.post(upload_url, data=form) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(
+                            f"docs upload вернул HTTP {resp.status}: {body[:200]}. "
+                            f"Пробуем отправить как фото..."
+                        )
+                        return await send_image_as_photo(user_id, file_path, caption)
                     upload_result = await resp.json()
 
-        if "file" not in upload_result:
-            logger.error("Ошибка загрузки документа: файл отсутствует в ответе VK")
-            return None
+        if not upload_result or "file" not in upload_result:
+            logger.warning(
+                f"docs.save не вернул file: {upload_result}. "
+                f"Пробуем отправить как фото..."
+            )
+            return await send_image_as_photo(user_id, file_path, caption)
 
-        # Сохраняем документ
+        # 3. Сохраняем документ
         doc_data = await api.docs.save(
             file=upload_result["file"],
             title=os.path.basename(file_path)
@@ -195,9 +278,12 @@ async def send_image_as_document(
             )
             return doc_id
 
+        logger.warning("docs.save вернул пустой результат, пробуем как фото...")
+        return await send_image_as_photo(user_id, file_path, caption)
+
     except Exception as e:
-        logger.error(f"Ошибка отправки документа: {e}")
-        return None
+        logger.error(f"Ошибка отправки документа: {e}. Пробуем как фото...")
+        return await send_image_as_photo(user_id, file_path, caption)
 
 
 def build_keyboard(buttons_data: list[list[tuple[str, str, str]]]) -> str:
