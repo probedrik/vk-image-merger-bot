@@ -11,16 +11,18 @@ import uuid
 import asyncio
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from dotenv import load_dotenv
 from PIL import Image
 
 from vkbottle import (
-    Bot, Keyboard, KeyboardButtonColor, Text,
+    API, Bot, Keyboard, KeyboardButtonColor, Text,
     BaseStateGroup, BuiltinStateDispenser
 )
 from vkbottle.bot import BotLabeler, Message
+from vkbottle.http import AiohttpClient
 
 from your_image_script import combine_images
 from yadisk_service import YandexDiskService
@@ -38,11 +40,32 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 МБ
 TEMP_DIR = tempfile.gettempdir()
 RESULT_LIFETIME = 3600  # 1 час
 
+# Прокси для исходящих запросов (HTTP_PROXY/HTTPS_PROXY из .env).
+# VK API недоступен с зарубежных серверов — трафик идёт через московский squid.
+PROXY_URL = (
+    os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("ALL_PROXY") or ""
+).strip()
+
+
+def proxy_label() -> str:
+    # Хост:порт прокси для лога — без креденшелов.
+    if not PROXY_URL:
+        return "без прокси (прямые запросы)"
+    try:
+        parsed = urlparse(PROXY_URL)
+        return f"прокси {parsed.hostname}:{parsed.port}"
+    except ValueError:
+        return "прокси задан"
+
+
 # Инициализация сервиса Яндекс.Диска
 yadisk_service = YandexDiskService(YADISK_TOKEN) if YADISK_TOKEN else None
 
-# Инициализация бота и хранилища
-bot = Bot(token=VK_TOKEN)
+# Инициализация бота и хранилища.
+# trust_env=True — HTTP-клиент vkbottle берёт прокси из HTTP_PROXY/HTTPS_PROXY (.env),
+# иначе VK API недоступен с зарубежных серверов.
+bot = Bot(api=API(VK_TOKEN, http_client=AiohttpClient(trust_env=True)))
+logger.info(f"Сетевой режим: {proxy_label()}")
 labeler = BotLabeler()
 bot.labeler = labeler
 
@@ -125,7 +148,7 @@ async def download_vk_photo(photo_attachment, user_id: int) -> Optional[str]:
     temp_path = os.path.join(TEMP_DIR, f"{user_id}_{uuid.uuid4().hex[:8]}.jpg")
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.get(photo_url) as resp:
                 if resp.status == 200:
                     with open(temp_path, "wb") as f:
@@ -166,7 +189,7 @@ async def send_image_as_photo(
         upload_url = upload_info.upload_url
 
         # 2. Загружаем файл на сервер
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
                 form.add_field(
@@ -234,7 +257,7 @@ async def send_image_as_document(
         upload_url = upload_info.upload_url
 
         # 2. Загружаем файл
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
                 form.add_field(
