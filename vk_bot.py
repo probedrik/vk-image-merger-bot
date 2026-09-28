@@ -40,6 +40,11 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 МБ
 TEMP_DIR = tempfile.gettempdir()
 RESULT_LIFETIME = 3600  # 1 час
 
+# Отправка результата повторяется с backoff: VK периодически отдаёт
+# транзиентные 504/405 на upload.php и пустой photo у photos-эндпоинта.
+SEND_RETRY_DELAYS = (2, 5, 10)  # паузы между попытками, секунды
+UPLOAD_TIMEOUT = aiohttp.ClientTimeout(total=90, connect=20)  # не висеть минутами
+
 # Прокси для исходящих запросов (HTTP_PROXY/HTTPS_PROXY из .env).
 # VK API недоступен с зарубежных серверов — трафик идёт через московский squid.
 PROXY_URL = (
@@ -148,7 +153,7 @@ async def download_vk_photo(photo_attachment, user_id: int) -> Optional[str]:
     temp_path = os.path.join(TEMP_DIR, f"{user_id}_{uuid.uuid4().hex[:8]}.jpg")
 
     try:
-        async with aiohttp.ClientSession(trust_env=True) as session:
+        async with aiohttp.ClientSession(trust_env=True, timeout=UPLOAD_TIMEOUT) as session:
             async with session.get(photo_url) as resp:
                 if resp.status == 200:
                     with open(temp_path, "wb") as f:
@@ -189,7 +194,7 @@ async def send_image_as_photo(
         upload_url = upload_info.upload_url
 
         # 2. Загружаем файл на сервер
-        async with aiohttp.ClientSession(trust_env=True) as session:
+        async with aiohttp.ClientSession(trust_env=True, timeout=UPLOAD_TIMEOUT) as session:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
                 form.add_field(
@@ -206,15 +211,20 @@ async def send_image_as_photo(
                         return None
                     upload_result = await resp.json()
 
-        # 3. Проверяем ответ
-        if "photo" not in upload_result or "server" not in upload_result:
-            logger.error(f"Неожиданный ответ от upload сервера: {upload_result}")
+        # 3. Проверяем ответ: VK умеет отдавать photo="" при деградации —
+        # это не валидный ответ, иначе save упадёт с «photo is undefined»
+        photo = upload_result.get("photo")
+        server = upload_result.get("server")
+        if not photo or not server or str(photo) == "[]":
+            logger.error(
+                f"Неожиданный ответ от upload сервера: {str(upload_result)[:300]}"
+            )
             return None
 
         # 4. Сохраняем фото
         saved = await api.photos.save_messages_photo(
-            photo=upload_result["photo"],
-            server=str(upload_result["server"]),
+            photo=photo,
+            server=str(server),
             hash=upload_result.get("hash", "")
         )
 
@@ -257,7 +267,7 @@ async def send_image_as_document(
         upload_url = upload_info.upload_url
 
         # 2. Загружаем файл
-        async with aiohttp.ClientSession(trust_env=True) as session:
+        async with aiohttp.ClientSession(trust_env=True, timeout=UPLOAD_TIMEOUT) as session:
             with open(file_path, "rb") as f:
                 form = aiohttp.FormData()
                 form.add_field(
@@ -275,7 +285,7 @@ async def send_image_as_document(
                         return await send_image_as_photo(user_id, file_path, caption)
                     upload_result = await resp.json()
 
-        if not upload_result or "file" not in upload_result:
+        if not upload_result or not upload_result.get("file"):
             logger.warning(
                 f"docs.save не вернул file: {upload_result}. "
                 f"Пробуем отправить как фото..."
@@ -307,6 +317,38 @@ async def send_image_as_document(
     except Exception as e:
         logger.error(f"Ошибка отправки документа: {e}. Пробуем как фото...")
         return await send_image_as_photo(user_id, file_path, caption)
+
+
+async def send_result(
+    user_id: int, file_path: str, caption: str = "", on_retry=None
+) -> Optional[int]:
+    """
+    Отправить результат с ретраями: пара docs->photos повторяется с backoff
+    (SEND_RETRY_DELAYS), т.к. VK периодически отдаёт транзиентные 504/405
+    на upload.php и пустой photo у photos-эндпоинта — одна попытка не переживает.
+    on_retry — колбэк, вызывается один раз перед первой паузой.
+    """
+    attempts = len(SEND_RETRY_DELAYS) + 1
+    for i in range(attempts):
+        if i:
+            delay = SEND_RETRY_DELAYS[i - 1]
+            logger.warning(
+                f"Отправка результата не удалась, повтор {i}/{attempts - 1} "
+                f"через {delay} c"
+            )
+            if i == 1 and on_retry is not None:
+                # один раз сообщаем пользователю, что бот не завис, а повторяет
+                await on_retry()
+            await asyncio.sleep(delay)
+
+        result_id = await send_image_as_document(user_id, file_path, caption)
+        if result_id:
+            if i:
+                logger.info(f"Результат отправлен с попытки {i + 1}/{attempts}")
+            return result_id
+
+    logger.error(f"Отправка результата не удалась за {attempts} попыток")
+    return None
 
 
 def build_keyboard(buttons_data: list[list[tuple[str, str, str]]]) -> str:
@@ -393,10 +435,15 @@ async def cmd_history(message: Message):
 
     for i, (result_path, _) in enumerate(results, 1):
         if os.path.exists(result_path):
-            await send_image_as_document(
+            sent = await send_result(
                 user_id, result_path,
                 caption=f"Результат #{i}"
             )
+            if not sent:
+                await message.answer(
+                    f"⚠️ Не удалось отправить результат #{i}: "
+                    "VK временно недоступен, попробуйте позже."
+                )
         else:
             await message.answer(f"⚠️ Файл результата #{i} не найден.")
 
@@ -653,7 +700,12 @@ async def process_gap_input(message: Message, text: str):
     )
 
     # Обработка
-    await process_and_send(message, files_to_process, user_id, gap_mm)
+    ok = await process_and_send(message, files_to_process, user_id, gap_mm)
+
+    if not ok:
+        # Отправка не удалась: файлы и состояние НЕ трогаем — повторный
+        # ввод отступа переотправит результат без перезагрузки картинок
+        return
 
     # Удаляем temp-файлы (кроме кэшированных с Яндекс.Диска)
     for f in files_to_process:
@@ -674,8 +726,12 @@ async def process_gap_input(message: Message, text: str):
 
 async def process_and_send(
     message: Message, files: list, user_id: int, gap_mm: int
-):
-    """Объединить 3 изображения и отправить результат"""
+) -> bool:
+    """Объединить 3 изображения и отправить результат.
+
+    True — отправлено; False — не удалось (файлы и сессия не трогаются,
+    чтобы можно было повторить отправку без повторной загрузки картинок).
+    """
     try:
         await message.answer("⏳ Обрабатываю изображения...")
 
@@ -691,7 +747,7 @@ async def process_and_send(
                 await message.answer(
                     f"❌ Ошибка: файл не найден {os.path.basename(f)}"
                 )
-                return
+                return False
 
         output_path = os.path.join(
             TEMP_DIR, f"vk_result_{uuid.uuid4().hex[:8]}.jpg"
@@ -721,22 +777,33 @@ async def process_and_send(
                 f"✅ Обработка завершена! Отступ: {gap_mm} мм"
             )
 
-            # Отправляем результат как документ (без пережатия VK)
-            result_id = await send_image_as_document(
+            # Отправляем результат как документ (без пережатия VK),
+            # с ретраями на транзиентные сбои VK
+            result_id = await send_result(
                 user_id, output_path,
-                caption=f"✨ Объединённое изображение (отступ {gap_mm} мм)"
+                caption=f"✨ Объединённое изображение (отступ {gap_mm} мм)",
+                on_retry=lambda: message.answer(
+                    "⚠️ VK временно недоступен, повторяю отправку…"
+                ),
             )
 
             if not result_id:
                 await message.answer(
-                    "❌ Не удалось отправить результат. Попробуйте снова."
+                    "❌ Не удалось отправить результат: VK временно недоступен. "
+                    "Файлы и результат сохранены — напиши отступ ещё раз "
+                    "(например, 5), и я повторю отправку."
                 )
+                return False
+
+            return True
         else:
             await message.answer("❌ Ошибка при обработке файлов.")
+            return False
 
     except Exception as e:
         logger.exception(f"Ошибка в process_and_send: {e}")
         await message.answer("⛔ Внутренняя ошибка. Попробуйте позже.")
+        return False
 
 
 # ---------------------------------------------------------------------------
